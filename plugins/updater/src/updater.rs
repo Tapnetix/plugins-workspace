@@ -22,7 +22,7 @@ use reqwest::{
 };
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", test))]
 use std::ffi::OsStr;
 use tauri::{
     AppHandle, Resource, Runtime,
@@ -1140,18 +1140,11 @@ impl Update {
     #[cfg(feature = "zip")]
     fn extract_zip(&self, bytes: &[u8]) -> Result<WindowsUpdaterType> {
         let temp_dir = self.make_temp_dir()?;
-
-        let archive = std::io::Cursor::new(bytes);
-        let mut extractor = zip::ZipArchive::new(archive)?;
-        extractor.extract(&temp_dir)?;
-
-        let paths = std::fs::read_dir(&temp_dir)?;
-        for path in paths {
-            let path = path?.path();
-            let ext = path.extension();
-            if ext == Some(OsStr::new("exe")) {
+        if let Some(path) = extract_zip_installer(bytes, &temp_dir)? {
+            if path.extension() == Some(OsStr::new("exe")) {
                 return Ok(WindowsUpdaterType::nsis(path, None));
-            } else if ext == Some(OsStr::new("msi")) {
+            }
+            if path.extension() == Some(OsStr::new("msi")) {
                 return Ok(WindowsUpdaterType::msi(path, None));
             }
         }
@@ -1192,6 +1185,24 @@ impl Update {
         let temp = temp_file.into_temp_path();
         Ok((temp.to_path_buf(), Some(temp)))
     }
+}
+
+// Kept separate from the Windows-only installer wrapper so the exact production ZIP
+// extraction path can be exercised on every host platform.
+#[cfg(all(feature = "zip", any(windows, test)))]
+fn extract_zip_installer(bytes: &[u8], destination: &std::path::Path) -> Result<Option<PathBuf>> {
+    let archive = std::io::Cursor::new(bytes);
+    let mut extractor = zip::ZipArchive::new(archive)?;
+    extractor.extract(destination)?;
+
+    for entry in std::fs::read_dir(destination)? {
+        let path = entry?.path();
+        if matches!(path.extension(), Some(ext) if ext == OsStr::new("exe") || ext == OsStr::new("msi")) {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Linux (AppImage, Deb, RPM)
@@ -2875,5 +2886,76 @@ mod tests {
         for (orig, escaped) in cases.iter().zip(cases_escaped) {
             assert_eq!(escape_nsis_current_exe_arg(OsStr::new(orig)), escaped);
         }
+    }
+}
+
+#[cfg(all(test, feature = "zip"))]
+mod zip_extract_tests {
+    use super::extract_zip_installer;
+    use std::io::{Cursor, Write};
+    use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+    fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, contents) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn extracts_root_level_exe_and_msi_installer_paths() {
+        for (name, contents) in [("setup.exe", b"exe".as_slice()), ("setup.msi", b"msi")] {
+            let destination = tempfile::tempdir().unwrap();
+            let result = extract_zip_installer(&archive(&[(name, contents)]), destination.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.file_name().unwrap(), name);
+            assert_eq!(std::fs::read(result).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn nested_installer_is_not_selected_as_a_root_installer() {
+        let destination = tempfile::tempdir().unwrap();
+        let found = extract_zip_installer(
+            &archive(&[("nested/setup.exe", b"exe")]),
+            destination.path(),
+        )
+        .unwrap();
+        assert!(found.is_none());
+        assert_eq!(std::fs::read(destination.path().join("nested/setup.exe")).unwrap(), b"exe");
+    }
+
+    #[test]
+    fn rejects_parent_traversal_without_writing_outside_destination() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("extract");
+        let result = extract_zip_installer(&archive(&[("../outside.exe", b"exe")]), &destination);
+        assert!(result.is_err());
+        assert!(!parent.path().join("outside.exe").exists());
+    }
+
+    #[test]
+    fn does_not_extract_symlink_entries_as_installers() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("extract");
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .add_symlink("outside.exe", "../outside.exe", SimpleFileOptions::default())
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        assert!(extract_zip_installer(&bytes, &destination).is_err());
+        assert!(!parent.path().join("outside.exe").exists());
+    }
+
+    #[test]
+    fn rejects_malformed_zip_before_selecting_an_installer() {
+        let destination = tempfile::tempdir().unwrap();
+        assert!(extract_zip_installer(b"PK\x03\x04 malformed", destination.path()).is_err());
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
     }
 }
